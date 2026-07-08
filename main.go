@@ -19,24 +19,199 @@ import (
 )
 
 // ==========================================
-// НАСТРОЙКИ ФИЛЬТРАЦИИ И ПОИСКА СПЛЕШЕЙ
+// КОНФИГ (настройки фильтрации и поиска сплешей)
 // ==========================================
-const (
-	IntervalSeconds  = 1     // Интервал проверки (в секундах)
-	ThresholdPercent = 0.1   // Минимальное движение цены (в %)
-	MinVolumeUSD     = 200.0 // Минимальный объем торгов внутри интервала (в USD)
-	AlertCooldownSec = 30    // Не слать повторный алерт по той же паре чаще, чем раз в N секунд
+// Все настройки читаются из config.json рядом с программой.
+// Если файла нет — он создается автоматически со значениями по умолчанию.
+const configFile = "config.json"
+
+type ExchangeToggles struct {
+	MEXC   bool `json:"mexc"`
+	KuCoin bool `json:"kucoin"`
+	Gate   bool `json:"gate"`
+	Bitget bool `json:"bitget"`
+}
+
+type Config struct {
+	IntervalSeconds  int             `json:"interval_seconds"`   // Интервал проверки (в секундах)
+	ThresholdPercent float64         `json:"threshold_percent"`  // Минимальное движение цены (в %)
+	MinVolumeUSD     float64         `json:"min_volume_usd"`     // Минимальный объем торгов внутри интервала (в USD)
+	AlertCooldownSec int             `json:"alert_cooldown_sec"` // Не слать повторный алерт по паре чаще, чем раз в N секунд
+	Quotes           []string        `json:"quotes"`             // Котировки-доллары: для них объем price*quantity считается как USD
+	Exchanges        ExchangeToggles `json:"exchanges"`          // Какие биржи мониторить
+}
+
+var (
+	cfg   Config
+	cfgMu sync.RWMutex // защищает поля cfg, которые редактируются на лету через бота
 )
 
-// ==========================================
-// TELEGRAM
-// ==========================================
-// Токен бота задается переменной окружения TELEGRAM_BOT_TOKEN.
-// Запуск: TELEGRAM_BOT_TOKEN="123456:ABC..." ./splash
-const chatsFile = "tg_chats.json" // сюда сохраняются chat_id подписчиков
+func defaultConfig() Config {
+	return Config{
+		IntervalSeconds:  5,
+		ThresholdPercent: 2,
+		MinVolumeUSD:     2000.0,
+		AlertCooldownSec: 30,
+		Quotes:           []string{"USDT", "USDC"},
+		Exchanges:        ExchangeToggles{MEXC: true, KuCoin: true, Gate: true, Bitget: true},
+	}
+}
 
-// Котировки, приравненные к доллару: для них объем price*quantity — это USD.
-var usdQuotes = []string{"USDT", "USDC"}
+// loadConfig читает config.json. Если файла нет — создает его с дефолтами.
+func loadConfig() {
+	cfg = defaultConfig()
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		out, _ := json.MarshalIndent(cfg, "", "  ")
+		if werr := os.WriteFile(configFile, out, 0644); werr != nil {
+			log.Printf("⚠️ Не удалось создать %s: %v (использую настройки по умолчанию)", configFile, werr)
+		} else {
+			log.Printf("📝 Создан %s с настройками по умолчанию — отредактируйте под себя", configFile)
+		}
+		return
+	}
+
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Fatalf("❌ Ошибка чтения %s: %v", configFile, err)
+	}
+	if len(cfg.Quotes) == 0 {
+		cfg.Quotes = defaultConfig().Quotes
+	}
+	if cfg.IntervalSeconds < 1 {
+		cfg.IntervalSeconds = 1
+	}
+	log.Printf("⚙️ Настройки загружены из %s: порог=%.2f%%, объем=$%.0f, интервал=%dс, кулдаун=%dс",
+		configFile, cfg.ThresholdPercent, cfg.MinVolumeUSD, cfg.IntervalSeconds, cfg.AlertCooldownSec)
+}
+
+// saveConfig записывает текущий cfg обратно в config.json.
+func saveConfig() {
+	cfgMu.RLock()
+	out, _ := json.MarshalIndent(cfg, "", "  ")
+	cfgMu.RUnlock()
+	if err := os.WriteFile(configFile, out, 0644); err != nil {
+		log.Printf("⚠️ Не удалось сохранить %s: %v", configFile, err)
+	}
+}
+
+// filterSnapshot возвращает согласованный снимок фильтров под RLock.
+func filterSnapshot() (threshold, minVol float64, interval, cooldown int) {
+	cfgMu.RLock()
+	defer cfgMu.RUnlock()
+	return cfg.ThresholdPercent, cfg.MinVolumeUSD, cfg.IntervalSeconds, cfg.AlertCooldownSec
+}
+
+// ==========================================
+// .ENV (секреты и параметры окружения)
+// ==========================================
+// Файл .env лежит рядом с программой. Формат — KEY=VALUE построчно.
+// Поддерживаемые ключи:
+//   TELEGRAM_BOT_TOKEN  — токен бота от @BotFather
+//   ADMIN_IDS           — Telegram ID админов через запятую (напр. 111,222)
+//   ALERT_CHAT_ID       — ID форум-супергруппы, куда шлются алерты (напр. -1001234567890)
+//   TOPIC_MEXC          — message_thread_id топика MEXC
+//   TOPIC_KUCOIN        — message_thread_id топика KuCoin
+//   TOPIC_GATE          — message_thread_id топика Gate
+//   TOPIC_BITGET        — message_thread_id топика Bitget
+
+type EnvConfig struct {
+	Token  string
+	Admins map[int64]bool
+	ChatID int64
+	Topics map[string]int64 // exchange -> message_thread_id
+}
+
+// loadEnvFile читает .env в map. Отсутствие файла — не ошибка (можно задать
+// значения через настоящие переменные окружения).
+func loadEnvFile(path string) map[string]string {
+	m := make(map[string]string)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return m
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		val = strings.Trim(val, `"'`) // снимаем обрамляющие кавычки
+		m[key] = val
+	}
+	return m
+}
+
+func loadEnv() EnvConfig {
+	file := loadEnvFile(".env")
+	// Значение из .env приоритетнее; если его нет — берём из окружения ОС.
+	get := func(key string) string {
+		if v, ok := file[key]; ok && v != "" {
+			return v
+		}
+		return os.Getenv(key)
+	}
+
+	env := EnvConfig{
+		Admins: make(map[int64]bool),
+		Topics: make(map[string]int64),
+	}
+
+	env.Token = get("TELEGRAM_BOT_TOKEN")
+	if env.Token == "" {
+		log.Fatal("❌ Не задан TELEGRAM_BOT_TOKEN (в .env или переменной окружения)")
+	}
+
+	for _, part := range strings.Split(get("ADMIN_IDS"), ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			log.Printf("⚠️ .env: пропускаю некорректный ADMIN_IDS элемент %q", part)
+			continue
+		}
+		env.Admins[id] = true
+	}
+	if len(env.Admins) == 0 {
+		log.Println("⚠️ .env: ADMIN_IDS пуст — управлять ботом никто не сможет")
+	}
+
+	if v := get("ALERT_CHAT_ID"); v != "" {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			log.Fatalf("❌ .env: ALERT_CHAT_ID некорректен: %v", err)
+		}
+		env.ChatID = id
+	} else {
+		log.Println("⚠️ .env: ALERT_CHAT_ID не задан — алерты в канал отправляться не будут")
+	}
+
+	for exch, key := range map[string]string{
+		"MEXC": "TOPIC_MEXC", "KUCOIN": "TOPIC_KUCOIN",
+		"GATE": "TOPIC_GATE", "BITGET": "TOPIC_BITGET",
+	} {
+		if v := get(key); v != "" {
+			id, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				log.Printf("⚠️ .env: %s некорректен (%v) — топик пропущен", key, err)
+				continue
+			}
+			env.Topics[exch] = id
+		}
+	}
+
+	log.Printf("🔐 .env загружен: админов=%d, chat_id=%d, топиков=%d",
+		len(env.Admins), env.ChatID, len(env.Topics))
+	return env
+}
 
 // ==========================================
 // ОБЩИЕ СТРУКТУРЫ
@@ -74,8 +249,11 @@ func recordTrade(exchange, symbol string, price, quantity float64) {
 }
 
 func main() {
+	loadConfig()
+	env := loadEnv()
+
 	log.Println("🤖 Запуск Telegram-бота...")
-	tg := newTelegramBot()
+	tg := newTelegramBot(env)
 	go tg.pollUpdates()
 	go tg.senderLoop()
 
@@ -83,10 +261,18 @@ func main() {
 	go startAnalyzer(tg)
 
 	log.Println("🔌 Запуск воркеров бирж...")
-	go startMEXC()
-	go startKuCoin()
-	go startGate()
-	go startBitget()
+	if cfg.Exchanges.MEXC {
+		go startMEXC()
+	}
+	if cfg.Exchanges.KuCoin {
+		go startKuCoin()
+	}
+	if cfg.Exchanges.Gate {
+		go startGate()
+	}
+	if cfg.Exchanges.Bitget {
+		go startBitget()
+	}
 
 	select {}
 }
@@ -96,8 +282,18 @@ func main() {
 // ==========================================
 
 func startAnalyzer(tg *TelegramBot) {
-	ticker := time.NewTicker(IntervalSeconds * time.Second)
+	_, _, interval, _ := filterSnapshot()
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	defer ticker.Stop()
+
 	for range ticker.C {
+		threshold, minVol, curInterval, cooldown := filterSnapshot()
+		// Интервал могли изменить через бота — перезапускаем тикер на лету.
+		if curInterval != interval {
+			interval = curInterval
+			ticker.Reset(time.Duration(interval) * time.Second)
+		}
+
 		dataMu.Lock()
 		for key, stats := range marketData {
 			if len(stats.Prices) < 2 {
@@ -114,12 +310,12 @@ func startAnalyzer(tg *TelegramBot) {
 				absDiff = -absDiff
 			}
 
-			if absDiff >= ThresholdPercent && totalVolume >= MinVolumeUSD && shouldAlert(key) {
+			if absDiff >= threshold && totalVolume >= minVol && shouldAlert(key, cooldown) {
 				link := exchangeLink(key)
 
 				fmt.Println(strings.Repeat("-", 60))
 				fmt.Printf("🔥 СПЛЕШ [%s]: %s\n", key.Exchange, key.Symbol)
-				fmt.Printf("📊 Движение: %.2f%% за %d сек.\n", priceDiff, IntervalSeconds)
+				fmt.Printf("📊 Движение: %.2f%% за %d сек.\n", priceDiff, interval)
 				fmt.Printf("💰 Объем за интервал: $%.2f\n", totalVolume)
 				fmt.Printf("🔗 Ссылка: %s\n", link)
 				fmt.Println(strings.Repeat("-", 60))
@@ -129,10 +325,10 @@ func startAnalyzer(tg *TelegramBot) {
 					arrow = "📉"
 				}
 				text := fmt.Sprintf(
-					"🔥 <b>%s</b> — %s\n%s Движение: <b>%+.2f%%</b> за %d сек.\n💰 Объем: $%.0f\n🔗 %s",
-					key.Symbol, key.Exchange, arrow, priceDiff, IntervalSeconds, totalVolume, link,
+					"🔥 <b>%s</b> — %s\n%s Движение: <b>%+.2f%%</b> за %d сек.\n💰 Объем: $%.0f",
+					key.Symbol, key.Exchange, arrow, priceDiff, interval, totalVolume,
 				)
-				tg.enqueue(text)
+				tg.enqueue(alertMsg{Exchange: key.Exchange, Text: text, URL: link})
 			}
 
 			stats.Prices = nil
@@ -142,10 +338,10 @@ func startAnalyzer(tg *TelegramBot) {
 	}
 }
 
-func shouldAlert(key marketKey) bool {
+func shouldAlert(key marketKey, cooldownSec int) bool {
 	lastAlertMu.Lock()
 	defer lastAlertMu.Unlock()
-	if t, ok := lastAlert[key]; ok && time.Since(t) < AlertCooldownSec*time.Second {
+	if t, ok := lastAlert[key]; ok && time.Since(t) < time.Duration(cooldownSec)*time.Second {
 		return false
 	}
 	lastAlert[key] = time.Now()
@@ -155,7 +351,7 @@ func shouldAlert(key marketKey) bool {
 func exchangeLink(key marketKey) string {
 	switch key.Exchange {
 	case "MEXC":
-		for _, quote := range usdQuotes {
+		for _, quote := range cfg.Quotes {
 			if strings.HasSuffix(key.Symbol, quote) {
 				base := strings.TrimSuffix(key.Symbol, quote)
 				return fmt.Sprintf("https://www.mexc.com/exchange/%s_%s", base, quote)
@@ -173,7 +369,7 @@ func exchangeLink(key marketKey) string {
 }
 
 func isUSDQuote(quote string) bool {
-	for _, q := range usdQuotes {
+	for _, q := range cfg.Quotes {
 		if strings.EqualFold(quote, q) {
 			return true
 		}
@@ -185,62 +381,145 @@ func isUSDQuote(quote string) bool {
 // TELEGRAM BOT
 // ==========================================
 
-type TelegramBot struct {
-	token  string
-	chats  map[int64]bool
-	chatMu sync.Mutex
-	queue  chan string
+type alertMsg struct {
+	Exchange string
+	Text     string
+	URL      string
 }
 
-func newTelegramBot() *TelegramBot {
-	token := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if token == "" {
-		log.Fatal("❌ Не задана переменная окружения TELEGRAM_BOT_TOKEN")
+type TelegramBot struct {
+	token  string
+	admins map[int64]bool
+	chatID int64            // форум-супергруппа для алертов
+	topics map[string]int64 // exchange -> message_thread_id
+	queue  chan alertMsg
+
+	editing map[int64]string // adminID -> редактируемое поле ("interval"/"threshold"/"volume")
+	editMu  sync.Mutex
+}
+
+func newTelegramBot(env EnvConfig) *TelegramBot {
+	return &TelegramBot{
+		token:   env.Token,
+		admins:  env.Admins,
+		chatID:  env.ChatID,
+		topics:  env.Topics,
+		queue:   make(chan alertMsg, 1000),
+		editing: make(map[int64]string),
 	}
-	tg := &TelegramBot{
-		token: token,
-		chats: make(map[int64]bool),
-		queue: make(chan string, 1000),
-	}
-	tg.loadChats()
-	return tg
 }
 
 func (tg *TelegramBot) api(method string) string {
 	return "https://api.telegram.org/bot" + tg.token + "/" + method
 }
 
-func (tg *TelegramBot) loadChats() {
-	data, err := os.ReadFile(chatsFile)
+func (tg *TelegramBot) isAdmin(id int64) bool {
+	return tg.admins[id]
+}
+
+// post отправляет форму методу Bot API. Тело ответа нам не нужно.
+func (tg *TelegramBot) post(method string, form url.Values) {
+	resp, err := http.PostForm(tg.api(method), form)
 	if err != nil {
+		log.Printf("⚠️ Telegram %s: %v", method, err)
 		return
 	}
-	var ids []int64
-	if err := json.Unmarshal(data, &ids); err != nil {
-		return
+	defer resp.Body.Close()
+	if resp.StatusCode == 429 {
+		time.Sleep(2 * time.Second)
 	}
-	for _, id := range ids {
-		tg.chats[id] = true
-	}
-	log.Printf("✉️ Загружено подписчиков Telegram: %d", len(ids))
 }
 
-func (tg *TelegramBot) saveChats() {
-	ids := make([]int64, 0, len(tg.chats))
-	for id := range tg.chats {
-		ids = append(ids, id)
+func (tg *TelegramBot) sendText(chatID int64, text, replyMarkup string) {
+	form := url.Values{}
+	form.Set("chat_id", strconv.FormatInt(chatID, 10))
+	form.Set("text", text)
+	form.Set("parse_mode", "HTML")
+	form.Set("disable_web_page_preview", "true")
+	if replyMarkup != "" {
+		form.Set("reply_markup", replyMarkup)
 	}
-	data, _ := json.Marshal(ids)
-	_ = os.WriteFile(chatsFile, data, 0600)
+	tg.post("sendMessage", form)
 }
 
-// pollUpdates слушает входящие сообщения боту: любой, кто напишет боту
-// (например /start), подписывается на алерты.
+func (tg *TelegramBot) answerCallback(callbackID, text string) {
+	form := url.Values{}
+	form.Set("callback_query_id", callbackID)
+	if text != "" {
+		form.Set("text", text)
+	}
+	tg.post("answerCallbackQuery", form)
+}
+
+// enqueue кладёт алерт в очередь на отправку в канал.
+func (tg *TelegramBot) enqueue(msg alertMsg) {
+	select {
+	case tg.queue <- msg:
+	default:
+		// очередь переполнена — молча отбрасываем, чтобы не блокировать анализатор
+	}
+}
+
+func (tg *TelegramBot) senderLoop() {
+	for msg := range tg.queue {
+		if tg.chatID == 0 {
+			continue // ALERT_CHAT_ID не задан — слать некуда
+		}
+		tg.sendAlert(tg.topics[msg.Exchange], msg.Text, msg.URL)
+		time.Sleep(50 * time.Millisecond) // лимиты Telegram: ~30 сообщений/сек
+	}
+}
+
+// sendAlert шлёт алерт в нужный топик канала с кнопкой «Открыть график».
+func (tg *TelegramBot) sendAlert(threadID int64, text, chartURL string) {
+	markup, _ := json.Marshal(map[string]interface{}{
+		"inline_keyboard": [][]map[string]string{
+			{{"text": "📊 Открыть график", "url": chartURL}},
+		},
+	})
+
+	form := url.Values{}
+	form.Set("chat_id", strconv.FormatInt(tg.chatID, 10))
+	if threadID != 0 {
+		form.Set("message_thread_id", strconv.FormatInt(threadID, 10))
+	}
+	form.Set("text", text)
+	form.Set("parse_mode", "HTML")
+	form.Set("disable_web_page_preview", "true")
+	form.Set("reply_markup", string(markup))
+	tg.post("sendMessage", form)
+}
+
+// settingsMenu возвращает текст и inline-клавиатуру меню настроек.
+func (tg *TelegramBot) settingsMenu() (string, string) {
+	threshold, minVol, interval, cooldown := filterSnapshot()
+	text := fmt.Sprintf(
+		"⚙️ <b>Настройки фильтров</b>\n\n"+
+			"⏱ Интервал: <b>%d сек</b>\n"+
+			"📈 Порог движения: <b>%.2f%%</b>\n"+
+			"💰 Мин. объём: <b>%.0f USDT</b>\n"+
+			"🔁 Кулдаун: <b>%d сек</b>\n\n"+
+			"Выберите, что изменить:",
+		interval, threshold, minVol, cooldown,
+	)
+	markup, _ := json.Marshal(map[string]interface{}{
+		"inline_keyboard": [][]map[string]string{
+			{{"text": "⏱ Интервал", "callback_data": "edit_interval"}},
+			{{"text": "📈 % движения", "callback_data": "edit_threshold"}},
+			{{"text": "💰 Объём USDT", "callback_data": "edit_volume"}},
+		},
+	})
+	return text, string(markup)
+}
+
+// pollUpdates слушает апдейты. Реагирует только на админов из .env.
 func (tg *TelegramBot) pollUpdates() {
 	offset := 0
 	client := &http.Client{Timeout: 40 * time.Second}
 	for {
-		resp, err := client.Get(fmt.Sprintf("%s?timeout=30&offset=%d", tg.api("getUpdates"), offset))
+		u := fmt.Sprintf("%s?timeout=30&offset=%d&allowed_updates=[\"message\",\"callback_query\"]",
+			tg.api("getUpdates"), offset)
+		resp, err := client.Get(u)
 		if err != nil {
 			time.Sleep(5 * time.Second)
 			continue
@@ -253,8 +532,23 @@ func (tg *TelegramBot) pollUpdates() {
 					Chat struct {
 						ID int64 `json:"id"`
 					} `json:"chat"`
+					From struct {
+						ID int64 `json:"id"`
+					} `json:"from"`
 					Text string `json:"text"`
 				} `json:"message"`
+				CallbackQuery *struct {
+					ID   string `json:"id"`
+					Data string `json:"data"`
+					From struct {
+						ID int64 `json:"id"`
+					} `json:"from"`
+					Message struct {
+						Chat struct {
+							ID int64 `json:"id"`
+						} `json:"chat"`
+					} `json:"message"`
+				} `json:"callback_query"`
 			} `json:"result"`
 		}
 		err = json.NewDecoder(resp.Body).Decode(&result)
@@ -265,65 +559,112 @@ func (tg *TelegramBot) pollUpdates() {
 		}
 		for _, upd := range result.Result {
 			offset = upd.UpdateID + 1
-			if upd.Message == nil {
-				continue
-			}
-			chatID := upd.Message.Chat.ID
-			tg.chatMu.Lock()
-			isNew := !tg.chats[chatID]
-			if isNew {
-				tg.chats[chatID] = true
-				tg.saveChats()
-			}
-			tg.chatMu.Unlock()
-			if isNew {
-				log.Printf("✉️ Новый подписчик Telegram: %d", chatID)
-				tg.sendTo(chatID, "✅ Оповещения о сплешах включены (MEXC, KuCoin, Gate, Bitget).")
+			switch {
+			case upd.CallbackQuery != nil:
+				tg.handleCallback(upd.CallbackQuery.ID, upd.CallbackQuery.From.ID,
+					upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Data)
+			case upd.Message != nil:
+				tg.handleMessage(upd.Message.From.ID, upd.Message.Chat.ID, upd.Message.Text)
 			}
 		}
 	}
 }
 
-func (tg *TelegramBot) enqueue(text string) {
-	select {
-	case tg.queue <- text:
-	default:
-		// очередь переполнена — молча отбрасываем, чтобы не блокировать анализатор
+func (tg *TelegramBot) handleMessage(userID, chatID int64, text string) {
+	if !tg.isAdmin(userID) {
+		return // бот отвечает только админам
 	}
-}
+	text = strings.TrimSpace(text)
 
-func (tg *TelegramBot) senderLoop() {
-	for text := range tg.queue {
-		tg.chatMu.Lock()
-		ids := make([]int64, 0, len(tg.chats))
-		for id := range tg.chats {
-			ids = append(ids, id)
-		}
-		tg.chatMu.Unlock()
-
-		for _, id := range ids {
-			tg.sendTo(id, text)
-			time.Sleep(50 * time.Millisecond) // лимиты Telegram: ~30 сообщений/сек
-		}
-	}
-}
-
-func (tg *TelegramBot) sendTo(chatID int64, text string) {
-	form := url.Values{}
-	form.Set("chat_id", strconv.FormatInt(chatID, 10))
-	form.Set("text", text)
-	form.Set("parse_mode", "HTML")
-	form.Set("disable_web_page_preview", "true")
-
-	resp, err := http.PostForm(tg.api("sendMessage"), form)
-	if err != nil {
-		log.Printf("⚠️ Telegram: ошибка отправки в %d: %v", chatID, err)
+	// Если админ в режиме ввода значения — принимаем введённое число.
+	tg.editMu.Lock()
+	field, editing := tg.editing[userID]
+	tg.editMu.Unlock()
+	if editing {
+		tg.applyEdit(userID, chatID, field, text)
 		return
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 429 {
-		time.Sleep(2 * time.Second)
+
+	switch {
+	case strings.HasPrefix(text, "/start"), strings.HasPrefix(text, "/settings"):
+		menu, markup := tg.settingsMenu()
+		tg.sendText(chatID, menu, markup)
+	default:
+		tg.sendText(chatID, "Команды: /settings — настройки фильтров.", "")
 	}
+}
+
+func (tg *TelegramBot) handleCallback(callbackID string, userID, chatID int64, data string) {
+	if !tg.isAdmin(userID) {
+		tg.answerCallback(callbackID, "Нет доступа")
+		return
+	}
+	var field, prompt string
+	switch data {
+	case "edit_interval":
+		field, prompt = "interval", "⏱ Введите интервал в секундах (целое число ≥ 1):"
+	case "edit_threshold":
+		field, prompt = "threshold", "📈 Введите порог движения в % (например 0.5):"
+	case "edit_volume":
+		field, prompt = "volume", "💰 Введите минимальный объём в USDT (например 500):"
+	default:
+		tg.answerCallback(callbackID, "")
+		return
+	}
+	tg.editMu.Lock()
+	tg.editing[userID] = field
+	tg.editMu.Unlock()
+	tg.answerCallback(callbackID, "")
+	tg.sendText(chatID, prompt, "")
+}
+
+// applyEdit применяет введённое админом значение к соответствующему полю cfg.
+func (tg *TelegramBot) applyEdit(userID, chatID int64, field, text string) {
+	num := strings.Replace(strings.TrimSpace(text), ",", ".", 1)
+
+	switch field {
+	case "interval":
+		v, err := strconv.Atoi(num)
+		if err != nil || v < 1 {
+			tg.sendText(chatID, "❌ Нужно целое число ≥ 1. Попробуйте ещё раз или /settings для отмены.", "")
+			return
+		}
+		cfgMu.Lock()
+		cfg.IntervalSeconds = v
+		cfgMu.Unlock()
+	case "threshold":
+		v, err := strconv.ParseFloat(num, 64)
+		if err != nil || v <= 0 {
+			tg.sendText(chatID, "❌ Нужно положительное число (например 0.5). Попробуйте ещё раз.", "")
+			return
+		}
+		cfgMu.Lock()
+		cfg.ThresholdPercent = v
+		cfgMu.Unlock()
+	case "volume":
+		v, err := strconv.ParseFloat(num, 64)
+		if err != nil || v <= 0 {
+			tg.sendText(chatID, "❌ Нужно положительное число (например 500). Попробуйте ещё раз.", "")
+			return
+		}
+		cfgMu.Lock()
+		cfg.MinVolumeUSD = v
+		cfgMu.Unlock()
+	default:
+		tg.clearEdit(userID)
+		return
+	}
+
+	tg.clearEdit(userID)
+	saveConfig()
+	menu, markup := tg.settingsMenu()
+	tg.sendText(chatID, "✅ Сохранено.\n\n"+menu, markup)
+}
+
+func (tg *TelegramBot) clearEdit(userID int64) {
+	tg.editMu.Lock()
+	delete(tg.editing, userID)
+	tg.editMu.Unlock()
 }
 
 // ==========================================
