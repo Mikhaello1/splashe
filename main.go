@@ -325,7 +325,7 @@ func startAnalyzer(tg *TelegramBot) {
 					arrow = "📉"
 				}
 				text := fmt.Sprintf(
-					"🔥 <b>%s</b> — %s\n%s Движение: <b>%+.2f%%</b> за %d сек.\n💰 Объем: $%.0f",
+					"🔥 <code>%s</code> — %s\n%s Движение: <b>%+.2f%%</b> за %d сек.\n💰 Объем: $%.0f",
 					key.Symbol, key.Exchange, arrow, priceDiff, interval, totalVolume,
 				)
 				tg.enqueue(alertMsg{Exchange: key.Exchange, Text: text, URL: link})
